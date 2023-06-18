@@ -142,6 +142,7 @@ class CustomEnv(gym.Env):
         self.timeRecorder_2 = TimeRecoder()
         self.update_delay = []
 
+        self.analyst = Analyst()
 
 
     def step(self, action):
@@ -188,7 +189,7 @@ class CustomEnv(gym.Env):
         recent_errors_copy = np.absolute(recent_errors_copy)
         # reward = - np.mean(recent_errors_copy) * 10 - self.step_count / 0.2 #- abs_distance_error/10 
         reward = -self.step_count
-        
+
         # rescale reward :
         if not self.ban_scale_reward:
             reward = self.scale_reward(reward)
@@ -226,23 +227,24 @@ class CustomEnv(gym.Env):
             done = True
             print('done because of reaching the end of episodes')
             self.step_count = 0
-            episode_ts = self.timeRecorder.mark()
-            self.episode_ts.append(episode_ts)
-            self.episode_sigma.append(self.episode_max_absError / (abs(self.origin_error) + 1e-3))
+
+            # episode_ts = self.timeRecorder.mark()
+            # self.episode_ts.append(episode_ts)
+            # self.episode_sigma.append(self.episode_max_absError / (abs(self.origin_error) + 1e-3))
             
             self.pid_Controller_reset_complete = False
             self.reset_complete.clear()
-        # calculate tr:
-        if self.episode_get_tr:
-            pass
-        else:
-            if self.error * self.origin_error < 0:
-                episode_tr = self.timeRecorder.mark()
-                self.episode_tr.append(episode_tr)
-                self.episode_get_tr = True
-        # sigma calculate relative:  
-        if abs(self.error) > self.episode_max_absError:
-            self.episode_max_absError = abs(self.error)
+        # # calculate tr:
+        # if self.episode_get_tr:
+        #     pass
+        # else:
+        #     if self.error * self.origin_error < 0:
+        #         episode_tr = self.timeRecorder.mark()
+        #         self.episode_tr.append(episode_tr)
+        #         self.episode_get_tr = True
+        # # sigma calculate relative:  
+        # if abs(self.error) > self.episode_max_absError:
+        #     self.episode_max_absError = abs(self.error)
         
 
         # implement action towards the environment:
