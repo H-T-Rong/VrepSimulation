@@ -1,325 +1,421 @@
-import struct
-import math
+import pandas as pd
 import numpy as np
-import cv2
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
+import time
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 
 
-def get_pointcloud(color_img, depth_img, camera_intrinsics):
+def num_to_str(x):
 
-    # Get depth image size
-    im_h = depth_img.shape[0]
-    im_w = depth_img.shape[1]
-
-    # Project depth into 3D point cloud in camera coordinates
-    pix_x,pix_y = np.meshgrid(np.linspace(0,im_w-1,im_w), np.linspace(0,im_h-1,im_h))
-    cam_pts_x = np.multiply(pix_x-camera_intrinsics[0][2],depth_img/camera_intrinsics[0][0])
-    cam_pts_y = np.multiply(pix_y-camera_intrinsics[1][2],depth_img/camera_intrinsics[1][1])
-    cam_pts_z = depth_img.copy()
-    cam_pts_x.shape = (im_h*im_w,1)
-    cam_pts_y.shape = (im_h*im_w,1)
-    cam_pts_z.shape = (im_h*im_w,1)
-
-    # Reshape image into colors for 3D point cloud
-    rgb_pts_r = color_img[:,:,0]
-    rgb_pts_g = color_img[:,:,1]
-    rgb_pts_b = color_img[:,:,2]
-    rgb_pts_r.shape = (im_h*im_w,1)
-    rgb_pts_g.shape = (im_h*im_w,1)
-    rgb_pts_b.shape = (im_h*im_w,1)
-
-    cam_pts = np.concatenate((cam_pts_x, cam_pts_y, cam_pts_z), axis=1)
-    rgb_pts = np.concatenate((rgb_pts_r, rgb_pts_g, rgb_pts_b), axis=1)
-
-    return cam_pts, rgb_pts
+    return "{}".format(x)
 
 
-def get_heightmap(color_img, depth_img, cam_intrinsics, cam_pose, workspace_limits, heightmap_resolution):
+class RunningMeanStd:
+    # Dynamically calculate mean and std
+    # observation的shape应该是（sample， feature）
+    def __init__(self, shape):  # shape:the dimension of input data
+        self.n = 0
+        self.mean = np.zeros(shape)
+        self.S = np.zeros(shape)
+        self.std = np.sqrt(self.S)
 
-    # Compute heightmap size
-    heightmap_size = np.round(((workspace_limits[1][1] - workspace_limits[1][0])/heightmap_resolution, (workspace_limits[0][1] - workspace_limits[0][0])/heightmap_resolution)).astype(int)
-
-    # Get 3D point cloud from RGB-D images
-    surface_pts, color_pts = get_pointcloud(color_img, depth_img, cam_intrinsics)
-
-    # Transform 3D point cloud from camera coordinates to robot coordinates
-    surface_pts = np.transpose(np.dot(cam_pose[0:3,0:3],np.transpose(surface_pts)) + np.tile(cam_pose[0:3,3:],(1,surface_pts.shape[0])))
-
-    # Sort surface points by z value
-    sort_z_ind = np.argsort(surface_pts[:,2])
-    surface_pts = surface_pts[sort_z_ind]
-    color_pts = color_pts[sort_z_ind]
-
-    # Filter out surface points outside heightmap boundaries
-    heightmap_valid_ind = np.logical_and(np.logical_and(np.logical_and(np.logical_and(surface_pts[:,0] >= workspace_limits[0][0], surface_pts[:,0] < workspace_limits[0][1]), surface_pts[:,1] >= workspace_limits[1][0]), surface_pts[:,1] < workspace_limits[1][1]), surface_pts[:,2] < workspace_limits[2][1])
-    surface_pts = surface_pts[heightmap_valid_ind]
-    color_pts = color_pts[heightmap_valid_ind]
-
-    # Create orthographic top-down-view RGB-D heightmaps
-    color_heightmap_r = np.zeros((heightmap_size[0], heightmap_size[1], 1), dtype=np.uint8)
-    color_heightmap_g = np.zeros((heightmap_size[0], heightmap_size[1], 1), dtype=np.uint8)
-    color_heightmap_b = np.zeros((heightmap_size[0], heightmap_size[1], 1), dtype=np.uint8)
-    depth_heightmap = np.zeros(heightmap_size)
-    heightmap_pix_x = np.floor((surface_pts[:,0] - workspace_limits[0][0])/heightmap_resolution).astype(int)
-    heightmap_pix_y = np.floor((surface_pts[:,1] - workspace_limits[1][0])/heightmap_resolution).astype(int)
-    color_heightmap_r[heightmap_pix_y,heightmap_pix_x] = color_pts[:,[0]]
-    color_heightmap_g[heightmap_pix_y,heightmap_pix_x] = color_pts[:,[1]]
-    color_heightmap_b[heightmap_pix_y,heightmap_pix_x] = color_pts[:,[2]]
-    color_heightmap = np.concatenate((color_heightmap_r, color_heightmap_g, color_heightmap_b), axis=2)
-    depth_heightmap[heightmap_pix_y,heightmap_pix_x] = surface_pts[:,2]
-    z_bottom = workspace_limits[2][0]
-    depth_heightmap = depth_heightmap - z_bottom
-    depth_heightmap[depth_heightmap < 0] = 0
-    depth_heightmap[depth_heightmap == -z_bottom] = np.nan
-
-    return color_heightmap, depth_heightmap
-
-# Save a 3D point cloud to a binary .ply file
-def pcwrite(xyz_pts, filename, rgb_pts=None):
-    assert xyz_pts.shape[1] == 3, 'input XYZ points should be an Nx3 matrix'
-    if rgb_pts is None:
-        rgb_pts = np.ones(xyz_pts.shape).astype(np.uint8)*255
-    assert xyz_pts.shape == rgb_pts.shape, 'input RGB colors should be Nx3 matrix and same size as input XYZ points'
-
-    # Write header for .ply file
-    pc_file = open(filename, 'wb')
-    pc_file.write(bytearray('ply\n', 'utf8'))
-    pc_file.write(bytearray('format binary_little_endian 1.0\n', 'utf8'))
-    pc_file.write(bytearray(('element vertex %d\n' % xyz_pts.shape[0]), 'utf8'))
-    pc_file.write(bytearray('property float x\n', 'utf8'))
-    pc_file.write(bytearray('property float y\n', 'utf8'))
-    pc_file.write(bytearray('property float z\n', 'utf8'))
-    pc_file.write(bytearray('property uchar red\n', 'utf8'))
-    pc_file.write(bytearray('property uchar green\n', 'utf8'))
-    pc_file.write(bytearray('property uchar blue\n', 'utf8'))
-    pc_file.write(bytearray('end_header\n', 'utf8'))
-
-    # Write 3D points to .ply file
-    for i in range(xyz_pts.shape[0]):
-        pc_file.write(bytearray(struct.pack("fffccc",xyz_pts[i][0],xyz_pts[i][1],xyz_pts[i][2],rgb_pts[i][0].tostring(),rgb_pts[i][1].tostring(),rgb_pts[i][2].tostring())))
-    pc_file.close()
-
-
-def get_affordance_vis(grasp_affordances, input_images, num_rotations, best_pix_ind):
-    vis = None
-    for vis_row in range(num_rotations/4):
-        tmp_row_vis = None
-        for vis_col in range(4):
-            rotate_idx = vis_row*4+vis_col
-            affordance_vis = grasp_affordances[rotate_idx,:,:]
-            affordance_vis[affordance_vis < 0] = 0 # assume probability
-            # affordance_vis = np.divide(affordance_vis, np.max(affordance_vis))
-            affordance_vis[affordance_vis > 1] = 1 # assume probability
-            affordance_vis.shape = (grasp_affordances.shape[1], grasp_affordances.shape[2])
-            affordance_vis = cv2.applyColorMap((affordance_vis*255).astype(np.uint8), cv2.COLORMAP_JET)
-            input_image_vis = (input_images[rotate_idx,:,:,:]*255).astype(np.uint8)
-            input_image_vis = cv2.resize(input_image_vis, (0,0), fx=0.5, fy=0.5, interpolation=cv2.INTER_NEAREST)
-            affordance_vis = (0.5*cv2.cvtColor(input_image_vis, cv2.COLOR_RGB2BGR) + 0.5*affordance_vis).astype(np.uint8)
-            if rotate_idx == best_pix_ind[0]:
-                affordance_vis = cv2.circle(affordance_vis, (int(best_pix_ind[2]), int(best_pix_ind[1])), 7, (0,0,255), 2)
-            if tmp_row_vis is None:
-                tmp_row_vis = affordance_vis
-            else:
-                tmp_row_vis = np.concatenate((tmp_row_vis,affordance_vis), axis=1)
-        if vis is None:
-            vis = tmp_row_vis
+    def update(self, x):
+        x = np.array(x)
+        self.n += 1
+        if self.n == 1:
+            self.mean = x
+            self.std = x
         else:
-            vis = np.concatenate((vis,tmp_row_vis), axis=0)
+            old_mean = self.mean.copy()
+            self.mean = old_mean + (x - old_mean) / self.n
+            self.S = self.S + (x - old_mean) * (x - self.mean)
+            self.std = np.sqrt(self.S / self.n )
 
-    return vis
+class Normalization:
+    def __init__(self, shape):
+        self.running_ms = RunningMeanStd(shape=shape)
 
+    def __call__(self, x, update=True):
+        # Whether to update the mean and std,during the evaluating,update=Flase
+        if update:  
+            self.running_ms.update(x)
+        x = (x - self.running_ms.mean) / (self.running_ms.std + 1e-8)
 
-def get_difference(color_heightmap, color_space, bg_color_heightmap):
+        return x
 
-    color_space = np.concatenate((color_space, np.asarray([[0.0, 0.0, 0.0]])), axis=0)
-    color_space.shape = (color_space.shape[0], 1, 1, color_space.shape[1])
-    color_space = np.tile(color_space, (1, color_heightmap.shape[0], color_heightmap.shape[1], 1))
+class RewardScaling:
+    def __init__(self, shape, gamma):
+        self.shape = shape  # reward shape=1
+        self.gamma = gamma  # discount factor
+        self.running_ms = RunningMeanStd(shape=self.shape)
+        self.R = np.zeros(self.shape)
 
-    # Normalize color heightmaps
-    color_heightmap = color_heightmap.astype(float)/255.0
-    color_heightmap.shape = (1, color_heightmap.shape[0], color_heightmap.shape[1], color_heightmap.shape[2])
-    color_heightmap = np.tile(color_heightmap, (color_space.shape[0], 1, 1, 1))
+    def __call__(self, x):
+        self.R = self.gamma * self.R + x
+        self.running_ms.update(self.R)
+        x = x / (self.running_ms.std + 1e-8)  # Only divided std
+        return x
 
-    bg_color_heightmap = bg_color_heightmap.astype(float)/255.0
-    bg_color_heightmap.shape = (1, bg_color_heightmap.shape[0], bg_color_heightmap.shape[1], bg_color_heightmap.shape[2])
-    bg_color_heightmap = np.tile(bg_color_heightmap, (color_space.shape[0], 1, 1, 1))
+    def reset(self):  # When an episode is done,we should reset 'self.R'
+        self.R = np.zeros(self.shape)
 
-    # Compute nearest neighbor distances to key colors
-    key_color_dist = np.sqrt(np.sum(np.power(color_heightmap - color_space,2), axis=3))
-    # key_color_dist_prob = F.softmax(Variable(torch.from_numpy(key_color_dist), volatile=True), dim=0).data.numpy()
+class TimeRecoder:
+    def __init__(self) -> None:
+        
+        self.set_time = None
+        self.reset_time = None
+        self.init_time = None
+    
+    def set(self):
+        self.set_time = time.perf_counter()
 
-    bg_key_color_dist = np.sqrt(np.sum(np.power(bg_color_heightmap - color_space,2), axis=3))
-    # bg_key_color_dist_prob = F.softmax(Variable(torch.from_numpy(bg_key_color_dist), volatile=True), dim=0).data.numpy()
+    def reset(self):
+        self.reset_time = time.perf_counter()
+        if self.set_time is not None:
+            _temp = self.set_time
+        else:
+            raise RuntimeError("Time Recorder not set yet")
+        self.set_time = time.perf_counter()
 
-    key_color_match = np.argmin(key_color_dist, axis=0)
-    bg_key_color_match = np.argmin(bg_key_color_dist, axis=0)
-    key_color_match[key_color_match == color_space.shape[0] - 1] = color_space.shape[0] + 1
-    bg_key_color_match[bg_key_color_match == color_space.shape[0] - 1] = color_space.shape[0] + 2
+        return (self.reset_time - _temp)
+    
+    def begin(self):
+        self.init_time = time.perf_counter()
+    
+    def mark(self):
+        return time.perf_counter() - self.init_time
+    
+        
 
-    return np.sum(key_color_match == bg_key_color_match).astype(float)/np.sum(bg_key_color_match < color_space.shape[0]).astype(float)
+    
+class Artist:
+    def __init__(self, data, pic_type, save_path) -> None:
+        self.data = dict()
+        self.pic_type = ''
+        self.supported_pic_types = ['']
 
+    def draw():
+        pass
+        
+    def save(self):
+        pass
 
-# Get rotation matrix from euler angles
-def euler2rotm(theta):
-    R_x = np.array([[1,         0,                  0                   ],
-                    [0,         math.cos(theta[0]), -math.sin(theta[0]) ],
-                    [0,         math.sin(theta[0]), math.cos(theta[0])  ]
-                    ])
-    R_y = np.array([[math.cos(theta[1]),    0,      math.sin(theta[1])  ],
-                    [0,                     1,      0                   ],
-                    [-math.sin(theta[1]),   0,      math.cos(theta[1])  ]
-                    ])         
-    R_z = np.array([[math.cos(theta[2]),    -math.sin(theta[2]),    0],
-                    [math.sin(theta[2]),    math.cos(theta[2]),     0],
-                    [0,                     0,                      1]
-                    ])            
-    R = np.dot(R_z, np.dot( R_y, R_x ))
-    return R
+class CustomLogger:
+    """我自己写的这个类可以包在with语句里用于写csv，语句块退出以后可以自动
+    调用close。
+    同时只在调用write时将内存中的数据写入外存中的文件，保证不在循环关键处消耗
+    时间复杂度。
+    写入外存后会删除内存中的数据
+    我个人觉得非常好用，尤其是在强化学习仿真环境中采集数据时
+    """
+    def __init__(self, file_path) -> None:
+        print('CustomLogger: init custom logger ! ')
+        log_name = 'env_data.csv'
+        self.data = []
+        self.file_handle = open(file_path + log_name, 'a')
+        self.n_sample = 0
+        
+        # return self
 
+    def __enter__(self):
+        print("CustomLogger: __enter__() called ! ")
+        return self
+    
+    def log(self, sample:list):
+        """记录每一个sample： (input: shape=(9,), output: shape=(7,))
 
-# Checks if a matrix is a valid rotation matrix.
-def isRotm(R) :
-    Rt = np.transpose(R)
-    shouldBeIdentity = np.dot(Rt, R)
-    I = np.identity(3, dtype = R.dtype)
-    n = np.linalg.norm(I - shouldBeIdentity)
-    return n < 1e-6
- 
- 
-# Calculates rotation matrix to euler angles
-def rotm2euler(R) :
- 
-    assert(isRotm(R))
+        Args:
+            sample (_type_): _description_
+        """
 
-    sy = math.sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
-    singular = sy < 1e-6
+        self.data.append(sample)
+        pass
 
-    if  not singular :
-        x = math.atan2(R[2,1] , R[2,2])
-        y = math.atan2(-R[2,0], sy)
-        z = math.atan2(R[1,0], R[0,0])
-    else :
-        x = math.atan2(-R[1,2], R[1,1])
-        y = math.atan2(-R[2,0], sy)
-        z = 0
- 
-    return np.array([x, y, z])
+    def write(self):
+        """ move data from memory to hard disk
+        """
+        for sample in self.data:
+            self.file_handle.write(', '.join(list(map(num_to_str, sample))) + '\n')
+        self.data.clear()
 
+        # clear data in memory:
 
-def angle2rotm(angle, axis, point=None):
-    # Copyright (c) 2006-2018, Christoph Gohlke
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        print("CustomLogger: __exit__() called! ")
 
-    sina = math.sin(angle)
-    cosa = math.cos(angle)
-    axis = axis/np.linalg.norm(axis)
-
-    # Rotation matrix around unit vector
-    R = np.diag([cosa, cosa, cosa])
-    R += np.outer(axis, axis) * (1.0 - cosa)
-    axis *= sina
-    R += np.array([[ 0.0,     -axis[2],  axis[1]],
-                      [ axis[2], 0.0,      -axis[0]],
-                      [-axis[1], axis[0],  0.0]])
-    M = np.identity(4)
-    M[:3, :3] = R
-    if point is not None:
-
-        # Rotation not around origin
-        point = np.array(point[:3], dtype=np.float64, copy=False)
-        M[:3, 3] = point - np.dot(R, point)
-    return M
-
-
-def rotm2angle(R):
-    # From: euclideanspace.com
-
-    epsilon = 0.01 # Margin to allow for rounding errors
-    epsilon2 = 0.1 # Margin to distinguish between 0 and 180 degrees
-
-    assert(isRotm(R))
-
-    if ((abs(R[0][1]-R[1][0])< epsilon) and (abs(R[0][2]-R[2][0])< epsilon) and (abs(R[1][2]-R[2][1])< epsilon)):
-        # Singularity found
-        # First check for identity matrix which must have +1 for all terms in leading diagonaland zero in other terms
-        if ((abs(R[0][1]+R[1][0]) < epsilon2) and (abs(R[0][2]+R[2][0]) < epsilon2) and (abs(R[1][2]+R[2][1]) < epsilon2) and (abs(R[0][0]+R[1][1]+R[2][2]-3) < epsilon2)):
-            # this singularity is identity matrix so angle = 0
-            return [0,1,0,0] # zero angle, arbitrary axis
-
-        # Otherwise this singularity is angle = 180
-        angle = np.pi
-        xx = (R[0][0]+1)/2
-        yy = (R[1][1]+1)/2
-        zz = (R[2][2]+1)/2
-        xy = (R[0][1]+R[1][0])/4
-        xz = (R[0][2]+R[2][0])/4
-        yz = (R[1][2]+R[2][1])/4
-        if ((xx > yy) and (xx > zz)): # R[0][0] is the largest diagonal term
-            if (xx< epsilon):
-                x = 0
-                y = 0.7071
-                z = 0.7071
-            else:
-                x = np.sqrt(xx)
-                y = xy/x
-                z = xz/x
-        elif (yy > zz): # R[1][1] is the largest diagonal term
-            if (yy< epsilon):
-                x = 0.7071
-                y = 0
-                z = 0.7071
-            else:
-                y = np.sqrt(yy)
-                x = xy/y
-                z = yz/y
-        else: # R[2][2] is the largest diagonal term so base result on this
-            if (zz< epsilon):
-                x = 0.7071
-                y = 0.7071
-                z = 0
-            else:
-                z = np.sqrt(zz)
-                x = xz/z
-                y = yz/z
-        return [angle,x,y,z] # Return 180 deg rotation
-
-    # As we have reached here there are no singularities so we can handle normally
-    s = np.sqrt((R[2][1] - R[1][2])*(R[2][1] - R[1][2]) + (R[0][2] - R[2][0])*(R[0][2] - R[2][0]) + (R[1][0] - R[0][1])*(R[1][0] - R[0][1])) # used to normalise
-    if (abs(s) < 0.001):
-        s = 1 
-
-    # Prevent divide by zero, should not happen if matrix is orthogonal and should be
-    # Caught by singularity test above, but I've left it in just in case
-    angle = np.arccos(( R[0][0] + R[1][1] + R[2][2] - 1)/2)
-    x = (R[2][1] - R[1][2])/s
-    y = (R[0][2] - R[2][0])/s
-    z = (R[1][0] - R[0][1])/s
-    return [angle,x,y,z]
+        self.file_handle.close()
+        print('file_close ! ')
 
 
-# Cross entropy loss for 2D outputs
-class CrossEntropyLoss2d(nn.Module):
-
-    def __init__(self, weight=None, size_average=True):
-        super(CrossEntropyLoss2d, self).__init__()
-        self.nll_loss = nn.NLLLoss2d(weight, size_average)
-
-    def forward(self, inputs, targets):
-        return self.nll_loss(F.log_softmax(inputs, dim=1), targets)
+def getLogger():
+    return CustomLogger()
+    
 
 
+import sklearn
+import random
+from sklearn.model_selection import train_test_split
+from torch.nn.functional import one_hot
+import torch
+
+def get_data(temp):
+    # map()的handle函数
+    return temp[0]
+
+def get_label(temp):
+    # map()的handle函数
+    return temp[1]
+
+class Dataset:
+    """定义数据集类
+    """
+    def __init__(self, data, label) -> None:
+        if type(data) != np.ndarray:
+            data = np.array(data)
+        if type(label) != np.ndarray:
+            label = np.array(label).squeeze()
+        
+        if label.shape[0] != data.shape[0]:
+            raise ValueError('样本数据多少和标签多少不一致')
+        self.data = data
+        self.label = label
+
+    def __len__(self):
+
+        return self.data.shape[0]
+    def __getitem__(self, key):
+
+        return self.data[key], self.label[key]
+
+
+class DataLoader:
+    """定义数据加载器类
+    """
+    def __init__(self, dataset:list, batch_size:int, shuffle=True, using_pytorch=False) -> None:
+        """_summary_
+
+        Args:
+            dataset (list): 下标0对应自变量，下标1对应因变量
+            batch_size (_type_): _description_
+            shuffle (bool, optional): _description_. Defaults to True.
+        """
+        if shuffle == True:
+            # map_handle_1 = map(get_data, sklearn.utils.shuffle(dataset))
+            # map_handle_2 = map(get_label, sklearn.utils.shuffle(dataset))
+
+            # data = list(map_handle_1)
+            # label = list(map_handle_2)
+            data = sklearn.utils.shuffle(dataset[0])
+            label = sklearn.utils.shuffle(dataset[1])
 
 
 
+            self.shuffle = True
+        if type(data) != np.ndarray:
+            data = np.array(data, dtype=np.float32)
+        if type(label)!= np.ndarray:
+            label = np.array(label, dtype=np.float32)
+
+        
+        self.dataset = Dataset(data, label)
+        self.batch_size = batch_size
+        self.current_idx = 0
+        self.iter_terminate = False
+        self.using_pytorch = using_pytorch
+
+    def __iter__(self):
+        """如果想要一个对象成为一个可迭代对象,既可以使用for,那么必须实现__iter__方法"""
+
+        return self
+    
+
+    def __next__(self):
+        if self.iter_terminate:
+            if self.shuffle == True:
+                map_handle_1 = map(get_data, sklearn.utils.shuffle(self.dataset))
+                map_handle_2 = map(get_label, sklearn.utils.shuffle(self.dataset))
+
+                data = list(map_handle_1)
+                label = list(map_handle_2)
+
+                self.dataset = Dataset(data=data, label=label)
+                
+            self.iter_terminate = False
+            raise StopIteration
+            return 
+        
+        current_idx = self.current_idx
+        
+        if current_idx + self.batch_size < len(self.dataset):
+            data_batch, label_batch = self.dataset[current_idx:current_idx+self.batch_size]
+            self.current_idx += self.batch_size
+        else:
+            left_num = len(self.dataset) - self.current_idx
+
+            prev_data, prev_labels = self.dataset[:current_idx]
+
+            data_scrap = random.choices(prev_data,k=left_num)
+            label_scrap = random.choices(prev_labels,k=left_num)
+
+            data_batch, label_batch = self.dataset[current_idx:]
+            data_batch = np.vstack([data_batch, data_scrap])
+            label_batch = np.array(label_batch.tolist()+label_scrap)
+
+            self.current_idx = 0
+            self.iter_terminate = True
+            
+        if self.using_pytorch:
+            return torch.tensor(data_batch, dtype=torch.float32, requires_grad=False), torch.tensor(label_batch, dtype=torch.float32, requires_grad=False)
+        else:
+            return data_batch, label_batch
+    def __len__(self):
+        return len(self.dataset)
+    
+def smooth_curve(curve_data):
+    """曲线平滑小道具，画图前使用它
+
+    Args:
+        curve_data (列表): 有序列表数据
+
+    Returns:
+        列表: 平滑后的列表数据
+    """
+    # curve_data是个有序列表,输出用移动平均法平滑后的曲线数据
+    if type(curve_data) == list:
+        curve_data = np.array(curve_data)
+    smooth_window = 10
+    smooth_data = np.zeros(curve_data.shape)
+    
+    # 滑动窗口大小为5
+    for i in range(len(curve_data)):
+        try:
+            window_data = curve_data[i-int(smooth_window/2):i+int(smooth_window/2):1]
+            smooth_data[i] = sum(window_data)/len(window_data)
+        except:
+            smooth_data[i] = curve_data[i]
+    return smooth_data
+
+def split_data(xdata, ydata):
+    """将数据分为训练集和测试集
+
+    Args:
+        xdata (pd.DataFrame): 数据
+        ydata (pd.DataFrame): 标签
+
+    Returns:
+        pd.DataFrame: 划分后的训练集和测试集
+    """
+    x_y = pd.concat([xdata, ydata], axis=1)
+    train, test = train_test_split(x_y, train_size=0.8, shuffle=True)
+    
+    x_train = train.iloc[:,:train.shape[1]-1]
+    y_train = train.iloc[:,train.shape[1]-1]
+
+    x_test = train.iloc[:,:train.shape[1]-1]
+    y_test = train.iloc[:,train.shape[1]-1]
+
+    return x_train, y_train, x_test, y_test
+
+def encode_label(ydata):
+    """将分类标签进行编码
+
+    Args:
+        ydata (unknoen): 是一个由整型变量组成的线性表
+
+    Returns:
+        torch.tensor: 经过one-hot编码的标签
+    """
+    # 对标签进行one-hot编码
+    unique_y = np.sort(np.unique(ydata)).tolist()
+    if type(ydata) == pd.Series:
+        ydata = np.array(ydata).tolist()
 
 
+    for i, y in enumerate(ydata):
+        ydata[i] = unique_y.index(y)
+    ydata = one_hot(torch.tensor(ydata, requires_grad=False))
+    return ydata
+
+def decode_label(label):
+    """对one-hot编码的标签进行解码
+
+    Args:
+        label (unknown): 是一个one-hot编码矩阵
+
+    Returns:
+        numpy.ndarray: 解码后的标签向量
+    """
+    if type(label) == pd.Series:
+        label = np.array(label)
+    if type(label) == torch.tensor:
+        label = label.numpy()
+    if type(label) != np.array:
+        label = np.array(label)
+    index = np.argmax(label, axis=1)
+    return index
+
+class NormalizeHelper:
+    def __init__(self, method='MinMaxScaler') -> None:
+        if method == 'MinMaxScaler':
+            self.scaler = MinMaxScaler()
+        elif method == 'StdScaler':
+            self.scaler = StandardScaler()
+        else:
+            self.scaler = MinMaxScaler()
+        self.data = None
 
 
+    def fit(self, data):
+        """计算当前数据集的标准化并保存标准化用到的平均值和标准差
 
+        Args:
+            data (_type_): _description_
 
+        Returns:
+            _type_: 返回标准化后的数据
+        """
+        self.data = data
+        return self.scaler.fit_transform(data)
+    
+    def reverse_normalize(self, data):
+        if self.data is None:
+            raise ValueError('Please normalize the data first!! ')
+        else:
+            return self.scaler.inverse_transform(data)
 
+    def normalize(self, data):
+        """用已保存的标准差和平均值标准化数据
 
+        Args:
+            data (_type_): _description_
 
+        Returns:
+            _type_: 返回标准化后的数据
+        """
+        return self.scaler.transform(data)
 
+    
+if __name__ == "__main__":
+    # test normalization
+    Scaler = NormalizeHelper(method='StdScaler')
+
+    x = np.array([[1,2,3],[4,5,6],[2,4,5]])
+    nor_x = Scaler.fit(x)
+    print(nor_x)
+
+    print(Scaler.reverse_normalize(nor_x))
+    print(Scaler.normalize(data=x[1:,:]))
+
+    # testing file logger:
+
+    # with CustomLogger() as logger:
+    #     for i in range(10):
+    #         for i in range(10):
+    #             logger.log([666,666,666])
+    #         print('data len: ', len(logger.data))
+    #         logger.write()
+            
+    #     pass
+
+    # testing DataLoader:
+    
