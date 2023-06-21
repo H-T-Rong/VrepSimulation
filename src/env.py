@@ -14,10 +14,10 @@ from utils import Normalization
 from utils import RewardScaling
 
 from analyst import Analyst
-from callback import CustomCallback
+
 from traceback import print_stack
 from threading import Lock
-
+import pandas as pd
 
 N_FEATURES = 6
 # 假设观测变量个
@@ -127,11 +127,15 @@ class CustomEnv(gym.Env):
         self.target_velocity = None
         self.timeRecorder = TimeRecoder() # 用于计算上升时间和持续时间
 
-        self.episode_ts = [] #记录每个episode的调节时间
-        self.episode_tr = [] #记录每个episode的上升时间
-        self.episode_sigma = [] #记录每个episode的超调量
-        self.episode_get_tr = False
-        self.episode_max_absError = 0 #记录每个episode最大的误差的绝对值
+        # self.episode_ts = [] #记录每个episode的调节时间
+        # self.episode_tr = [] #记录每个episode的上升时间
+        # self.episode_sigma = [] #记录每个episode的超调量
+        # self.episode_get_tr = False
+        # self.episode_max_absError = 0 #记录每个episode最大的误差的绝对值
+
+        self.tr = None
+        self.ts = None
+        self.sigma = None
 
         self.dead_loop = 0 #记录死循环次数
 
@@ -212,11 +216,11 @@ class CustomEnv(gym.Env):
                 # reward = reward + self.done_count / 4
                 self.done_count = 0
                 done = True
-                episode_ts = self.timeRecorder.mark()
-                self.episode_ts.append(episode_ts) # calculate ts
-                self.episode_sigma.append(self.episode_max_absError / abs(self.origin_error)) # calculate sigma
-                if len(self.episode_tr) < len(self.episode_sigma):
-                    self.episode_tr.append(0)
+                # episode_ts = self.timeRecorder.mark()
+                # self.episode_ts.append(episode_ts) # calculate ts
+                # self.episode_sigma.append(self.episode_max_absError / abs(self.origin_error)) # calculate sigma
+                # if len(self.episode_tr) < len(self.episode_sigma):
+                #     self.episode_tr.append(0)
                 self.pid_Controller_reset_complete = False
                 self.reset_complete.clear()
             else:
@@ -338,7 +342,7 @@ class CustomEnv(gym.Env):
         #     pass
 
         self.reset_complete.wait() # wait until reset complete
-        self.timeRecorder.begin()
+        # self.timeRecorder.begin()
 
         print('env.py: reset(): get reset confirm message, reset complete')
 
@@ -354,6 +358,16 @@ class CustomEnv(gym.Env):
         # else:
         #     self.sock.sendall(send_message.encode('utf-8'))
         self.reset_lock.release()
+
+        if self.analyst.range < 10:
+            pass
+        else:
+            self.analyst.preprocess()
+            self.ts = self.analyst.get_ts()
+            self.tr = self.analyst.get_tr()
+            self.sigma = self.analyst.get_sigma()
+
+            self.analyst.reset()
 
         return (observation,info)  # reward, done, info can't be included
 
@@ -378,6 +392,7 @@ class CustomEnv(gym.Env):
 
         # 计算update thread的频率
         # self.timeRecorder_2.set()
+
 
         while(True):
             if self.communication_protocol == 'UDP':
@@ -422,11 +437,13 @@ class CustomEnv(gym.Env):
                 # 当再次接收到pidController发来的error数据时，认为reset完毕
                 if not self.pid_Controller_reset_complete:
                     if message == 'reset_confirm':
+                        
                         if package_idx == 0:
                             pass
                         else:
                             raise RuntimeError('package idx is not correct, socket communication needs checking')
-                        
+                        self.timeRecorder.begin()
+
                         print('env.py: socket_communication(): pidController reset complete, judging from reset_confirm')
                         origin_error = error
                         self.origin_error = origin_error
@@ -448,11 +465,15 @@ class CustomEnv(gym.Env):
                         self.reset_complete.set()
 
                         self.dead_loop = 0
+
                     else:
                         self.dead_loop += 1
                         if self.dead_loop > 3000:
                             raise RuntimeError('reset environment fail')
                         continue
+                time = self.timeRecorder.mark()
+                self.analyst.append(pd.DataFrame([[package_idx, error, time]], columns=['idx','error','time']))
+
             # 计算update thread的频率
             # delay = self.timeRecorder_2.reset()
             # self.update_delay.append(delay)
@@ -485,8 +506,8 @@ class CustomEnv(gym.Env):
         else:
             return None
     
-    def get_episode_evaluation_data(self):
-        return (self.episode_tr, self.episode_ts, self.episode_sigma)
+    # def get_episode_evaluation_data(self):
+    #     return (self.episode_tr, self.episode_ts, self.episode_sigma)
     
     def evaluation_reset(self):
         self.target_velocity_idx = 0
@@ -503,12 +524,14 @@ class CustomEnv(gym.Env):
 
         self.reset()
         
-        self.episode_tr.clear()
-        self.episode_sigma.clear()
-        self.episode_ts.clear()
+        # self.episode_tr.clear()
+        # self.episode_sigma.clear()
+        # self.episode_ts.clear()
 
         time.sleep(1)
-
+    def get_indicator(self):
+        
+        return self.tr, self.ts, self.sigma
     # def set_obstacle(self):
     #     self.robot.add
 

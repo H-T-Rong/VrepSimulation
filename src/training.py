@@ -3,6 +3,7 @@ from stable_baselines3.common.env_checker import check_env
 import matplotlib.pyplot as plt
 import os
 import random
+from callback import TensorboardCallback
 
 MODEL_SAVE_PATH = './model/'
 TENSORBOARD_PATH = './output/training/tensorboard_log/'
@@ -83,7 +84,7 @@ with CustomLogger(LOG_WRITE_PATH) as logger:
 
         # Train the agent and display a progress bar
         # model.learn(total_timesteps=int(15e4), progress_bar=True)
-        model.learn(total_timesteps=int(5e4), progress_bar=True)
+        model.learn(total_timesteps=int(5e4), progress_bar=True, callback=TensorboardCallback())
         
         # Save the agent
         model.save(MODEL_SAVE_PATH + "PID_tuner" + algorithmType)

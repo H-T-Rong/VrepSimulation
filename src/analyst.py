@@ -103,7 +103,7 @@ class Analyst:
                 # 计算上升时间
                 origin_error = self.error_arr[0]
                 if origin_error < 0:
-                    for i, error in self.error_arr:
+                    for i, error in enumerate(self.error_arr):
                         if error > 0:
                             self.tr_step = i
                             break
@@ -166,6 +166,7 @@ class Analyst:
         self.tr = None
         self.sort_complete = False
         self.error_arr = None
+        self.range = 0
 
     def illustrate(self, save_path=None, show=False):
 
