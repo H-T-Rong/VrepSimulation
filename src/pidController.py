@@ -154,11 +154,15 @@ class PIDController:
                 break
 
             self.current_force = self.robot.getForce(self.robot.motor, opmode='streaming')
-            if angular is None or self.current_force is None:
-                self.NoneType_Object.clear()
-                continue
-            else:
-                self.NoneType_Object.set()
+
+            # make sure the object is not None Type
+            self.noneType_check(self.target_velocity,
+                                self.current_velocity,
+                                self.current_force,
+                                self.error,
+                                self.I,
+                                self.D,
+                                self.send_package_idx)
 
             self.current_velocity = angular[2] # 弧度制角速度
 
@@ -183,8 +187,6 @@ class PIDController:
             
 
     def serverRecvThread(self):
-
-        
 
         print('PID server recv thread start working ')
 
@@ -300,7 +302,7 @@ class PIDController:
 
         Args:
             sleep_time (_type_): 线程延迟时间
-        """
+        """ 
         print('PID server send thread start waiting ')
         if self.communication_protocol == 'TCP':
             while self.client_conn is None:
@@ -324,6 +326,7 @@ class PIDController:
                 continue
             # 发送数据包：'当前速度的编号,当前速度,当前力,当前误差,当前警告,当前积分项,当前微分项'
             try:
+        
                 self.NoneType_Object.wait() # 等待CoppeliaSim数据传输到位再开始发送给env
                 if self.reset_confirm:
                     send_message = 'reset_confirm:{},{:.4f},{:.4f},{:.4f},{},{:.4f},{:.4f};{}'.format(self.target_velocity_idx,
@@ -430,6 +433,23 @@ class PIDController:
                 print('send thread frequency: ', 1/self.delay_sec_3)
             if self.global_end_flag:
                 break
+
+    def noneType_check(self, *lst):
+        """ 检查lst中的数据，如果有空，则清除NoneType_Object条件，避免发出空数据
+
+        Returns:
+            _type_: _description_
+        """
+        for ele in lst:
+            if ele is None:
+                self.NoneType_Object.clear()
+                return False
+            else:
+                pass
+
+        self.NoneType_Object.set()
+        return True
+
         
 
 
